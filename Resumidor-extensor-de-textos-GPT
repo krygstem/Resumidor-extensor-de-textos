@@ -1,0 +1,156 @@
+import PyPDF2
+import openai
+import requests
+import json
+import datetime
+import os
+import time
+import pickle
+import concurrent.futures
+from nltk.tokenize import sent_tokenize
+from docx import Document
+from tkinter import filedialog
+from tkinter import Tk
+
+# Initialize OpenAI API key
+openai.api_key = 'SUA API'
+
+# Set headers and URL for OpenAI API requests
+headers = {"Authorization": f"Bearer {openai.api_key}", "Content-Type": "application/json"}
+link = "https://api.openai.com/v1/chat/completions"
+id_modelo = "gpt-3.5-turbo"
+
+# Ask the user to choose a summary level
+summary_level = input("Por favor, escolha o nível de resumo ou expansão (1 - Resumo de 20%; 2 - Resumo de 50%; 3 - Resumo de 75%; 4 - Expansão de 150%; 5 - Expansão de 200%; 6 - Expansão de 400%): ")
+
+# Ask the user to choose a complexity level
+complexity_level = input("Por favor, escolha o nível de complexidade (1 - Criança de 5 anos; 2 - Adolescente de 14 anos; 3 - Jovem adulto pré-universitário; 4 - Nível universitário completo; 5 - Nível de mestrado; 6 - Nível de doutorado): ")
+
+# Ask the user to choose the number of simultaneous processes
+processes = input("Por favor, escolha a quantidade de processos simultâneos (1 a 16): ")
+processes = max(1, min(int(processes), 16))  # Ensure that the number of processes is between 1 and 16
+
+#Pergunta se há comando adicional a ser usado para o ChatGPT
+aditional_info = input("Por favor, coloque qualquer comando adicional para o GPT (incluindo idioma): ")
+
+# Ask for the file address
+root = Tk()
+root.withdraw()  # we don't want a full GUI, so keep the root window from appearing
+file_path = filedialog.askopenfilename()  # show an "Open" dialog box and return the path to the selected file
+
+# Check if there's a checkpoint file
+resume = False
+if os.path.isfile('checkpoint.pkl'):
+    answer = input("Uma tentativa anterior foi suspensa abruptamente. Deseja continuar de onde parou? (s/n) ")
+    if answer.lower() == "s":
+        resume = True
+
+# Check the file extension and read the file accordingly
+file_extension = os.path.splitext(file_path)[1]
+text = ""
+
+if not resume:
+    if file_extension == ".pdf":
+        with open(file_path, "rb") as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+    elif file_extension == ".txt":
+        with open(file_path, "r") as file:
+            text = file.read()
+    elif file_extension in [".doc", ".docx"]:
+        doc = Document(file_path)
+        for para in doc.paragraphs:
+            text += para.text
+else:
+    with open('checkpoint.pkl', 'rb') as f:
+        checkpoint = pickle.load(f)
+        text = checkpoint['text']
+
+# Tokenize the text into sentences
+sentences = sent_tokenize(text)
+
+# Split the sentences into 3000 token segments, ensuring that no sentence is split in half
+text_segments = []
+current_segment = ""
+for sentence in sentences:
+    if len((current_segment + sentence).split()) > 1000:
+        text_segments.append(current_segment)
+        current_segment = sentence
+    else:
+        current_segment += " " + sentence
+text_segments.append(current_segment)
+
+# Map the summary level to a summary instruction
+summary_instructions = {
+    "1": "Por favor, forneça um resumo fiel com 20% da extensão do seguinte texto. Escreva em primeira pessoa:",
+    "2": "Por favor, forneça um resumo fiel com 50% da extensão do seguinte texto. Escreva em primeira pessoa:",
+    "3": "Por favor, forneça um resumo fiel com 75% da extensão do seguinte texto. Escreva em primeira pessoa:",
+    "4": "Por favor, forneça uma expansão fiel com 150% da extensão do seguinte texto. Escreva em primeira pessoa:",
+    "5": "Por favor, forneça uma expansão fiel com 200% da extensão do seguinte texto. Escreva em primeira pessoa:",
+    "6": "Por favor, forneça uma expansão fiel com 400% da extensão do seguinte texto. Escreva em primeira pessoa:"
+}
+
+complexity_level_doer = {
+    "1": "Use linguagem adequada para uma criança de cinco anos entender.",
+    "2": "Use linguagem adequada para um adolescente de 14 anos entender.",
+    "3": "Use linguagem adequada para um jovem adulto de 18 anos entender.",
+    "4": "Use linguagem adequada para um universitário recém formado entender.",
+    "5": "Use linguagem adequada para um acadêmico com mestrado entender.",
+    "6": "Use linguagem adequada para um acadêmico com doutroado entender."
+}
+
+# Function to summarize a text segment
+def resume_sentences(content_part):
+    body_mensagem = {
+        "model": id_modelo,
+        "temperature": 0.0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Você é uma Inteligência Artificial auxiliar."
+            },
+            {
+                "role": "user",
+                "content": f"{summary_instructions[summary_level]} {complexity_level_doer[complexity_level]} {aditional_info} O texto fonte é: {content_part}"
+            }
+        ]
+    }
+    body_mensagem = json.dumps(body_mensagem)
+    requisicao = requests.post(link, headers=headers, data=body_mensagem)
+    resposta = requisicao.json()
+    mensagem = resposta["choices"][0]["message"]["content"]
+    print(mensagem)
+    return mensagem
+
+# Create a filename with the current date and time
+now = datetime.datetime.now()
+filename = f"summary_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+
+# Get the directory path of the original file
+dir_path = os.path.dirname(file_path)
+
+# Combine the directory path with the new filename
+file_path = os.path.join(dir_path, filename)
+
+# Summarize each text segment and write the summaries to the new .txt file
+start_segment = 0
+if resume:
+    start_segment = checkpoint['start_segment']
+
+with open(file_path, 'w') as f:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=processes) as executor:
+        future_to_segment = {executor.submit(resume_sentences, segment): segment for segment in text_segments[start_segment:]}
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_segment)):
+            summary = future.result()
+            f.write(f"Parte {i + 1}:\n{summary}\n\n")
+            print(f"Escreveu parte: {i +1}")
+            f.flush()  # ensure writing to disk after each segment
+            checkpoint = {'text': text, 'start_segment': i+1}
+            with open('checkpoint.pkl', 'wb') as c:
+                pickle.dump(checkpoint, c)
+            time.sleep(0.03)
+
+# If the process completes successfully, delete the checkpoint file
+if os.path.isfile('checkpoint.pkl'):
+    os.remove('checkpoint.pkl')
